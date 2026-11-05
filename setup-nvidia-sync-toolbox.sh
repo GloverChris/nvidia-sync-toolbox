@@ -2,7 +2,7 @@
 
 # Install NVIDIA Sync in an Ubuntu 24.04 Toolbx on an immutable Fedora/Bluefin
 # host, add a user-scoped desktop launcher, and forward browser opens from the
-# container to the host. See README-nvidia-sync-toolbox.md before running.
+# container to the host. See README.md before running.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
