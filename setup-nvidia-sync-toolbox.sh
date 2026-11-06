@@ -7,7 +7,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly DEFAULT_CONTAINER="nvidia-sync"
 readonly DEFAULT_IMAGE="quay.io/toolbx/ubuntu-toolbox:24.04"
 readonly NVIDIA_DOC_URL="https://docs.nvidia.com/sync/latest/getting-started.html"
@@ -20,6 +20,7 @@ mode_selected=0
 enable_browser_bridge=1
 test_browser=0
 license_accepted=0
+install_host_dependencies=0
 work_dir=""
 toolbox_bin=""
 launcher_path=""
@@ -48,6 +49,8 @@ Install options:
   --image IMAGE                Ubuntu Toolbx image
                                (default: quay.io/toolbx/ubuntu-toolbox:24.04)
   --accept-nvidia-license      Confirm you reviewed NVIDIA's license terms
+  --install-host-dependencies  Allow installing missing Toolbx/Podman on mutable
+                               Fedora (sudo dnf); never layers an immutable host
   --no-browser-bridge          Do not install the host-browser handoff
   --test-browser               Explicitly open NVIDIA's Getting Started page
                                through the installed host-browser handoff
@@ -85,6 +88,10 @@ while (($#)); do
             ;;
         --accept-nvidia-license)
             license_accepted=1
+            shift
+            ;;
+        --install-host-dependencies)
+            install_host_dependencies=1
             shift
             ;;
         --no-browser-bridge)
@@ -132,6 +139,73 @@ fi
 if [[ "$test_browser" -eq 1 && "$enable_browser_bridge" -eq 0 ]]; then
     die "--test-browser cannot be used with --no-browser-bridge"
 fi
+
+if [[ "$mode" != "install" && "$install_host_dependencies" -eq 1 ]]; then
+    die "--install-host-dependencies is available only during install mode"
+fi
+
+# Host dependency helpers are kept separate so tests can mock package managers.
+host_install_platform() {
+    # Presence of either image-management tool is deliberately conservative:
+    # never assume that dnf is safe just because it exists on an image host.
+    if [[ -e /run/ostree-booted ]] || command -v rpm-ostree >/dev/null 2>&1 ||
+        command -v bootc >/dev/null 2>&1; then
+        printf '%s\n' immutable
+        return
+    fi
+    local ID=""
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+    fi
+    printf '%s\n' "${ID:-unknown}"
+}
+
+ensure_host_dependencies() {
+    local dependency platform reply
+    local -a missing=()
+    for dependency in toolbox podman; do
+        command -v "$dependency" >/dev/null 2>&1 || missing+=("$dependency")
+    done
+    [[ "${#missing[@]}" -gt 0 ]] || return 0
+
+    warn "Missing host dependencies: ${missing[*]}"
+    [[ "$mode" == "install" ]] || die "$mode mode will not install host packages"
+    platform="$(host_install_platform)"
+    case "$platform" in
+        immutable)
+            warn "An OSTree/bootc image-managed host was detected. Toolbx is normally included on Fedora Atomic desktops."
+            warn "Check PATH and your image's documentation; this script will not layer packages or reboot the host."
+            warn "Bluefin: https://docs.projectbluefin.io/administration/#local-layering"
+            die "restore Toolbx/Podman using your image's supported procedure, then rerun this script"
+            ;;
+        fedora)
+            command -v dnf >/dev/null 2>&1 || die "Fedora detected but dnf is unavailable; install toolbox and podman using your distribution's instructions"
+            ;;
+        *)
+            die "automatic host installation is not supported for '$platform'; install Toolbx and rootless Podman following https://containertoolbx.org/install/ then rerun"
+            ;;
+    esac
+
+    log "Mutable Fedora detected. Installing missing host packages requires sudo."
+    printf '[nvidia-sync-toolbox] Command: sudo dnf install --yes'
+    printf ' %s' "${missing[@]}"
+    printf '\n'
+    if [[ "$install_host_dependencies" -ne 1 ]]; then
+        [[ -t 0 ]] || die "rerun with --install-host-dependencies to approve this host package installation"
+        read -r -p "Install these host packages now? [y/N] " reply
+        [[ "$reply" =~ ^[Yy]$ ]] || die "host package installation cancelled"
+    fi
+    command -v sudo >/dev/null 2>&1 || die "sudo is unavailable; install the missing host packages as an administrator"
+    sudo dnf install --yes "${missing[@]}" || die "host package installation failed; resolve the package-manager error and rerun"
+    hash -r
+    for dependency in toolbox podman; do
+        command -v "$dependency" >/dev/null 2>&1 || die "host installation finished but '$dependency' is still unavailable in PATH"
+    done
+}
+# End host dependency helpers.
+
+ensure_host_dependencies
 
 for command_name in toolbox podman cmp grep install mktemp; do
     command -v "$command_name" >/dev/null 2>&1 || die "required host command not found: $command_name"
@@ -260,7 +334,7 @@ readonly keyring="/etc/apt/keyrings/nvidia-sync-toolbox.gpg"
 readonly source_file="/etc/apt/sources.list.d/nvidia-sync-toolbox.list"
 
 apt-get update
-apt-get install --yes --no-install-recommends ca-certificates curl gnupg flatpak-xdg-utils
+apt-get install --yes --no-install-recommends ca-certificates curl gnupg flatpak-xdg-utils libnss-mdns
 
 if apt-cache policy nvidia-sync 2>/dev/null | grep -Fq "$repo_url"; then
     printf '[nvidia-sync-toolbox] Reusing an existing NVIDIA APT repository configuration\n'
@@ -330,6 +404,33 @@ fi
 
 dpkg-query -W nvidia-sync "$alsa_package"
 CONTAINER_ROOT
+}
+
+# Installing libnss-mdns normally adds the NSS entry via Ubuntu's maintainer
+# script. Check it rather than replacing a user's resolver configuration.
+check_mdns() {
+    podman exec --interactive "$container_name" /bin/sh -s <<'MDNS_CHECK'
+set -eu
+if [ "$(dpkg-query -W -f='${Status}' libnss-mdns 2>/dev/null || true)" != "install ok installed" ]; then
+    printf '%s\n' '[nvidia-sync-toolbox] WARNING: libnss-mdns is missing; rerun install mode to enable .local lookup' >&2
+    exit 1
+fi
+# Ignore comments and accept IPv4-capable mdns modules only. mdns6 alone
+# does not support the IPv4 device addresses used by this setup.
+if ! awk '
+    /^[[:space:]]*hosts[[:space:]]*:/ {
+        sub(/#.*/, "")
+        sub(/^[^:]*:/, "")
+        for (i = 1; i <= NF; i++)
+            if ($i ~ /^mdns(4)?(_minimal)?$/) found = 1
+    }
+    END { exit !found }
+' /etc/nsswitch.conf; then
+    printf '%s\n' '[nvidia-sync-toolbox] WARNING: container hosts: lookup has no IPv4-capable mDNS entry in /etc/nsswitch.conf; see README troubleshooting. Existing resolver configuration was preserved.' >&2
+    exit 1
+fi
+printf '%s\n' '[nvidia-sync-toolbox] mDNS package and NSS configuration: ready (device reachability not tested)'
+MDNS_CHECK
 }
 
 bridge_compatible() {
@@ -420,6 +521,8 @@ check_setup() {
         warn "ALSA runtime library is missing"
         failed=1
     fi
+
+    check_mdns || failed=1
 
     if [[ "$enable_browser_bridge" -eq 1 ]]; then
         if bridge_compatible && \

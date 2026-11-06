@@ -8,7 +8,7 @@ This community setup runs NVIDIA Sync inside an Ubuntu 24.04 Toolbx while keepin
 
 1. Creates or safely reuses an Ubuntu 24.04 amd64 Toolbx.
 2. Installs NVIDIA Sync from NVIDIA's stable APT repository.
-3. Installs the ALSA runtime library needed by the current Electron binary.
+3. Installs the ALSA runtime library needed by the current Electron binary and `libnss-mdns` for `.local` device discovery.
 4. Adds a container-local `xdg-open` bridge that asks Bluefin to open URLs with its current default browser.
 5. Adds `~/.local/share/applications/nvidia-sync-toolbox.desktop` so NVIDIA Sync appears in the app menu and can be pinned to the dock.
 
@@ -88,7 +88,8 @@ Host user account:
 Named Toolbx only:
 
 - `/usr/local/bin/xdg-open`
-- `nvidia-sync`, `flatpak-xdg-utils`, and an ALSA runtime package
+- `nvidia-sync`, `flatpak-xdg-utils`, `libnss-mdns`, and an ALSA runtime package
+- Ubuntu’s `libnss-mdns` package may add its mDNS entry to the container’s `/etc/nsswitch.conf`; the script checks this and does not replace custom resolver settings.
 - For a fresh repository setup only:
   - `/etc/apt/sources.list.d/nvidia-sync-toolbox.list`
   - `/etc/apt/keyrings/nvidia-sync-toolbox.gpg`
@@ -138,3 +139,63 @@ Not exercised here, to avoid changing the known-good machine:
 Toolbx officially supports creating containers for another distribution/release, including Ubuntu, as documented in [Toolbx distro support](https://containertoolbx.org/distros/). NVIDIA's current Sync overview and platform guidance are in the [NVIDIA Sync User Guide](https://docs.nvidia.com/sync/latest/).
 
 Rerunning install mode refreshes APT metadata and can upgrade NVIDIA Sync to the current version in NVIDIA's stable repository.
+
+## Local device discovery and troubleshooting
+
+Sync may initially work with cached device IP addresses but later show a device
+as offline when its `.local` hostname cannot resolve inside the Toolbx. Host
+resolution alone is not sufficient: the Ubuntu container also needs the mDNS NSS
+module. Install mode now includes `libnss-mdns`; Ubuntu normally adds
+`mdns4_minimal [NOTFOUND=return]` to the `hosts:` line in `/etc/nsswitch.conf`.
+Existing users can rerun install mode to add the dependency (this also refreshes
+APT metadata and may upgrade Sync).
+
+`--check` verifies that the package is installed and that an IPv4-capable mDNS
+module is present on the active container `hosts:` line. It does not contact a
+device or guarantee discovery across your network. If a custom NSS configuration
+has no mDNS entry, the check fails with guidance instead of overwriting it. Review
+the container's resolver ordering and any return rules before editing it; a typical
+Ubuntu configuration includes `files mdns4_minimal [NOTFOUND=return] dns`.
+Preserve other services and policy appropriate for your system. See the
+[nss-mdns documentation](https://github.com/avahi/nss-mdns).
+
+To diagnose a particular device, replace the example name with your device's
+hostname and use the same container name as your install:
+
+```bash
+toolbox run --container nvidia-sync -- getent ahostsv4 device.local
+```
+
+If it still fails, check that the device is awake, advertises mDNS, and is on a
+network where multicast DNS traffic is allowed. Host Avahi availability and
+network/firewall rules also matter. The script does not modify the host resolver,
+firewall, network services, or device addresses. Avoid posting real hostnames,
+addresses, or Sync state files when sharing diagnostics.
+
+### Regression checks
+
+Run `python3 tests/test_mdns.py` for isolated package/NSS regression fixtures.
+These checks never install packages or touch a real container. Real device
+resolution was verified on the existing Ubuntu 24.04 setup after installing
+`libnss-mdns 0.15.1-4build1`; a clean installation is still not exercised.
+
+
+## Missing Toolbx or Podman on the host
+
+The script detects missing `toolbox` and `podman` commands before creating a container. On **mutable Fedora only**, it shows the exact `sudo dnf install --yes` command for the missing packages and asks before running it. For unattended use, explicitly opt in:
+
+```bash
+./setup-nvidia-sync-toolbox.sh --install-host-dependencies --accept-nvidia-license
+```
+
+This flag is separate from accepting NVIDIA's license. Existing commands are left alone, and the script verifies both are available after package installation. `--check` and rollback never install host packages, and reject this install-only flag.
+
+On **Bluefin, Fedora Atomic, and other OSTree/bootc hosts**, the script stops with guidance instead of invoking DNF, layering packages, or rebooting. Toolbx is normally preinstalled on Fedora Atomic desktops. A missing command can indicate a PATH or image problem. Restore it using your image's supported procedure before rerunning. Bluefin discourages local package layering, so this script does not automatically change its immutable base. Unknown distributions also stop with the official installation link rather than guessing a package manager.
+
+Sources: [Toolbx installation](https://containertoolbx.org/install/), [Fedora Toolbx documentation](https://docs.fedoraproject.org/en-US/fedora-silverblue/toolbox/), and [Bluefin local layering guidance](https://docs.projectbluefin.io/administration/#local-layering).
+
+Host package installation paths are covered by mocks, not by installing or removing anything on the working desktop. To run the host preflight regression tests:
+
+```bash
+bash tests/test-host-dependencies.sh
+```
